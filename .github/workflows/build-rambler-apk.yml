@@ -1,0 +1,154 @@
+
+name: Build Rambler Bangla APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Download private base APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release download base-apk \
+            --repo "$REPO" \
+            --pattern base.apk \
+            --output "$RUNNER_TEMP/base.apk"
+          test -s "$RUNNER_TEMP/base.apk"
+          sha256sum "$RUNNER_TEMP/base.apk"
+
+      - name: Checkout Rambler-Bangla source
+        uses: actions/checkout@v4
+        with:
+          repository: muhib-karim/Rambler-Bangla
+          path: source
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install verification dependency
+        run: python -m pip install androguard==4.1.4
+
+      - name: Bootstrap patching tools
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bash scripts/bootstrap_tools.sh
+          source tools/tool-env.sh
+          echo "SMALI_CP=$SMALI_CP" >> "$GITHUB_ENV"
+          echo "TOOLS_DIR=$TOOLS_DIR" >> "$GITHUB_ENV"
+
+      - name: Analyze base APK
+        working-directory: source
+        run: |
+          set -euo pipefail
+          source tools/tool-env.sh
+
+          python3 standalone-patcher/dex_patch.py analyze \
+            --apk "$RUNNER_TEMP/base.apk" \
+            --profile fingerprints/gboard-18.3.1.json \
+            --workdir "$RUNNER_TEMP/analyze-work" \
+            > "$RUNNER_TEMP/analysis.json"
+
+          python3 - "$RUNNER_TEMP/analysis.json" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          missing = [k for k, v in r["fingerprint_hits"].items() if not v]
+          missing += [
+              k for k, v in r["methods"].items()
+              if not isinstance(v, dict) or "dex" not in v
+          ]
+          if missing:
+              print("Fingerprint mismatch; refusing to patch:")
+              print("\n".join(missing))
+              sys.exit(1)
+          print("All required fingerprints and methods found.")
+          PY
+
+      - name: Build runtime DEX
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p build/ext-classes build/ext-dex
+
+          javac -d build/ext-classes \
+            extension-src/com/akshaykadam/pixelboard/extension/ramblerlite/GboardRamblerLiteScriptRuntime.java
+
+          java -cp tools/r8-8.3.37.jar \
+            com.android.tools.r8.D8 \
+            --min-api 24 \
+            --output build/ext-dex \
+            build/ext-classes/com/akshaykadam/pixelboard/extension/ramblerlite/*.class
+
+          test -s build/ext-dex/classes.dex
+
+      - name: Patch APK
+        working-directory: source
+        run: |
+          set -euo pipefail
+          source tools/tool-env.sh
+
+          python3 standalone-patcher/dex_patch.py patch \
+            --apk "$RUNNER_TEMP/base.apk" \
+            --out "$RUNNER_TEMP/rambler-unsigned.apk" \
+            --profile fingerprints/gboard-18.3.1.json \
+            --workdir "$RUNNER_TEMP/patch-work" \
+            --extension-dex build/ext-dex/classes.dex
+
+          test -s "$RUNNER_TEMP/rambler-unsigned.apk"
+
+      - name: Sign APK with a temporary key
+        working-directory: source
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/rambler-test.jks"
+
+          keytool -genkeypair \
+            -keystore "$key" \
+            -storepass changeit \
+            -keypass changeit \
+            -alias rambler \
+            -dname "CN=Rambler Bangla Local Build" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+          java -cp "tools/apksig-8.3.0.jar:tools/classes" \
+            MiniApkSigner sign \
+            "$key" changeit rambler changeit \
+            "$RUNNER_TEMP/rambler-unsigned.apk" \
+            "$RUNNER_TEMP/Rambler-Bangla.apk"
+
+          java -cp "tools/apksig-8.3.0.jar:tools/classes" \
+            MiniApkSigner verify "$RUNNER_TEMP/Rambler-Bangla.apk"
+
+          test -s "$RUNNER_TEMP/Rambler-Bangla.apk"
+          sha256sum "$RUNNER_TEMP/Rambler-Bangla.apk"
+
+      - name: Upload APK and analysis report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rambler-Bangla-APK
+          path: |
+            ${{ runner.temp }}/Rambler-Bangla.apk
+            ${{ runner.temp }}/analysis.json
+          if-no-files-found: error
+          retention-days: 3
