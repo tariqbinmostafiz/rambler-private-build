@@ -31,6 +31,27 @@ jobs:
         with:
           repository: muhib-karim/Rambler-Bangla
           path: source
+          
+      - name: Fix Unicode surrogate handling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("source/standalone-patcher/dex_patch.py")
+          s = p.read_text(encoding="utf-8")
+
+          old = '    return "".join(out)'
+          new = '''    return "".join(out).encode(
+          "utf-16-le", "surrogatepass"
+          ).decode("utf-16-le")'''
+
+          if old not in s:
+              raise SystemExit("Expected source line not found; refusing unsafe edit")
+
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          print("Unicode surrogate fix applied.")
+          PY
+
 
       - name: Set up Java
         uses: actions/setup-java@v4
